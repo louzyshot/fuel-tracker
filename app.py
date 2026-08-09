@@ -5,155 +5,151 @@ import json
 import pandas as pd
 from datetime import datetime
 import os
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Page Configuration for Mobile
-st.set_page_config(page_title="Fuel Tracker", page_icon="⛽", layout="centered")
+st.set_page_config(page_title="Fuel & Distance Tracker", page_icon="⛽", layout="centered")
 
-st.title("⛽ Fuel Consumption Tracker")
-st.write("Snap or upload a picture of your fuel receipt or pump screen to log your fill-up.")
+st.title("⛽ Fuel & Distance Tracker")
+st.write("Upload receipts and odometer photos to log fill-ups directly to Google Sheets.")
 
-# Fetch API Key from Streamlit Secrets or Environment
+# API Keys & Credentials
 api_key = st.secrets.get("GEMINI_API_KEY") if "GEMINI_API_KEY" in st.secrets else os.environ.get("GEMINI_API_KEY")
 
-if not api_key:
-    api_key = st.sidebar.text_input("Enter Gemini API Key manually:", type="password")
+# Google Sheets Helper Function
+def get_gspread_client():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    return gspread.authorize(creds)
 
-# Local CSV Storage
-DATA_FILE = "fuel_data.csv"
+def load_sheet_data():
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_key(st.secrets["SPREADSHEET_ID"]).worksheet("Logs")
+        data = sheet.get_all_records()
+        return pd.DataFrame(data), sheet
+    except Exception as e:
+        st.error(f"Google Sheets Connection Error: {e}")
+        return pd.DataFrame(), None
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        return pd.read_csv(DATA_FILE)
-    return pd.DataFrame(columns=["Date", "Fuel Type", "Price ($)", "Volume (L/Gal)", "Total Cost ($)"])
+# Image Processing Function with Fallback Models
+def extract_data_with_gemini(client, receipt_file, odo_file):
+    prompt = """
+    Analyze the provided images carefully:
+    1. Receipt / Fuel Display Image: Extract fuel_type, unit_price, volume, total_price, and purchase date (YYYY-MM-DD).
+    2. Odometer Dashboard Image (if provided): Extract current odometer reading (numeric value only, e.g. 45210).
 
-def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
+    Return strictly a raw JSON object with keys:
+    "date", "fuel_type", "unit_price", "volume", "total_price", "odometer"
 
-# File / Camera Input
-st.subheader("1. Capture Photo")
-image_file = st.file_uploader("Upload or take photo...", type=["jpg", "jpeg", "png"]) or st.camera_input("Take a photo")
+    If a value cannot be found, use null. Do not wrap in markdown or extra text.
+    """
+    
+    contents = []
+    if receipt_file:
+        contents.append(types.Part.from_bytes(data=receipt_file.getvalue(), mime_type=receipt_file.type or "image/jpeg"))
+    if odo_file:
+        contents.append(types.Part.from_bytes(data=odo_file.getvalue(), mime_type=odo_file.type or "image/jpeg"))
+    contents.append(prompt)
 
-if image_file:
-    st.image(image_file, caption="Selected Image", use_container_width=True)
+    candidate_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+    
+    for model_name in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            return json.loads(response.text), model_name
+        except Exception:
+            continue
+    return None, "Failed on all models"
 
-if image_file and api_key:
-    if st.button("Extract Fuel Data 🪄", type="primary"):
-        with st.spinner("Finding active model & extracting receipt data..."):
+# UI Layout: Dual Photo Upload
+st.subheader("1. Capture / Upload Images")
+col1, col2 = st.columns(2)
+
+with col1:
+    receipt_img = st.file_uploader("📷 Fuel Receipt / Display", type=["jpg", "jpeg", "png"], key="receipt")
+with col2:
+    odo_img = st.file_uploader("🚗 Odometer Dashboard", type=["jpg", "jpeg", "png"], key="odo")
+
+if receipt_img or odo_img:
+    if st.button("Extract All Data 🪄", type="primary"):
+        with st.spinner("AI analyzing receipt and odometer dashboard..."):
             try:
                 client = genai.Client(api_key=api_key)
-                mime_type = image_file.type if hasattr(image_file, "type") and image_file.type else "image/jpeg"
-                image_bytes = image_file.getvalue()
+                data, used_model = extract_data_with_gemini(client, receipt_img, odo_img)
                 
-                prompt = """
-                Analyze this fuel receipt or pump screen display. Extract the following:
-                - date: Date of purchase (YYYY-MM-DD format). If missing, return null.
-                - fuel_type: Type of fuel (e.g., Regular, Premium, Diesel). If unknown, return "Regular".
-                - unit_price: Price per liter or gallon (numeric value only).
-                - volume: Amount of fuel purchased in liters or gallons (numeric value only).
-                - total_price: Total cost paid (numeric value only).
-
-                Return strictly a raw JSON object with keys: "date", "fuel_type", "unit_price", "volume", "total_price".
-                Do not wrap in markdown code fences or extra text.
-                """
-
-                # Automatically discover supported models for your API key
-                available_models = []
-                try:
-                    for m in client.models.list():
-                        # Look for models supporting content generation
-                        if hasattr(m, 'supported_actions') and 'generateContent' in m.supported_actions:
-                            name = m.name.replace('models/', '')
-                            available_models.append(name)
-                        elif hasattr(m, 'name'):
-                            name = m.name.replace('models/', '')
-                            available_models.append(name)
-                except Exception:
-                    pass
-
-                # Fallback list if model listing is restricted
-                if not available_models:
-                    available_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash']
-
-                extracted_data = None
-                last_error = None
-                used_model = None
-
-                for model_name in available_models:
-                    # Filter for flash/vision models first
-                    if 'flash' in model_name or 'vision' in model_name or 'gemini' in model_name:
-                        try:
-                            response = client.models.generate_content(
-                                model=model_name,
-                                contents=[
-                                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                                    prompt
-                                ],
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json"
-                                )
-                            )
-                            extracted_data = json.loads(response.text)
-                            used_model = model_name
-                            st.session_state['data_extracted'] = extracted_data
-                            break
-                        except Exception as e:
-                            last_error = str(e)
-                            continue
-
-                if extracted_data:
-                    st.success(f"Successfully extracted using model: **{used_model}**")
+                if data:
+                    st.session_state['extracted_all'] = data
+                    st.success(f"Extracted using {used_model}!")
                 else:
-                    st.error(f"Could not process image with available models. Error: {last_error}")
-
+                    st.error("Could not process images properly.")
             except Exception as e:
-                st.error(f"Initialization error: {str(e)}")
+                st.error(f"Error: {e}")
 
-elif image_file and not api_key:
-    st.warning("Please provide a Gemini API Key in Streamlit Secrets or the sidebar to extract data.")
-
-# Verification Form
-if 'data_extracted' in st.session_state:
-    st.subheader("2. Verify & Save Details")
-    ext = st.session_state['data_extracted']
+# Verification & Calculation Form
+if 'extracted_all' in st.session_state:
+    st.subheader("2. Verify & Save to Google Sheets")
+    ext = st.session_state['extracted_all']
     
-    with st.form("verify_form"):
-        parsed_date = ext.get('date') if ext.get('date') else str(datetime.now().date())
-        
+    # Load previous history to calculate distance/efficiency
+    df_history, sheet_ref = load_sheet_data()
+    
+    last_odometer = 0.0
+    if not df_history.empty and 'Odometer' in df_history.columns:
+        valid_odo = [float(x) for x in df_history['Odometer'].values if str(x).replace('.','',1).isdigit()]
+        if len(valid_odo) > 0:
+            last_odometer = valid_odo[-1]
+
+    with st.form("verify_google_sheet_form"):
+        parsed_date = ext.get('date') or str(datetime.now().date())
         try:
             default_date = datetime.strptime(parsed_date, "%Y-%m-%d")
         except ValueError:
             default_date = datetime.now()
 
         date = st.date_input("Date", value=default_date)
-        fuel_type = st.text_input("Fuel Type", value=ext.get('fuel_type', 'Regular'))
-        price = st.number_input("Price per Unit", value=float(ext.get('unit_price') or 0.0), format="%.3f")
+        fuel_type = st.text_input("Fuel Type", value=ext.get('fuel_type') or "Regular")
+        price = st.number_input("Unit Price", value=float(ext.get('unit_price') or 0.0), format="%.3f")
         volume = st.number_input("Volume (L/Gal)", value=float(ext.get('volume') or 0.0), format="%.2f")
         total = st.number_input("Total Cost", value=float(ext.get('total_price') or 0.0), format="%.2f")
+        odometer = st.number_input("Current Odometer", value=float(ext.get('odometer') or 0.0), format="%.1f")
         
-        if st.form_submit_button("Save Entry 💾"):
-            df = load_data()
-            new_entry = pd.DataFrame([{
-                "Date": str(date),
-                "Fuel Type": fuel_type,
-                "Price ($)": price,
-                "Volume (L/Gal)": volume,
-                "Total Cost ($)": total
-            }])
-            df = pd.concat([df, new_entry], ignore_index=True)
-            save_data(df)
-            st.success("Receipt saved successfully!")
-            del st.session_state['data_extracted']
-            st.rerun()
+        # Calculate distance and MPG/KML on the fly
+        distance = max(0.0, odometer - last_odometer) if last_odometer > 0 and odometer > last_odometer else 0.0
+        efficiency = (distance / volume) if volume > 0 and distance > 0 else 0.0
+        
+        if last_odometer > 0:
+            st.caption(f"💡 Distance since last log: **{distance:.1f}** | Calculated Efficiency: **{efficiency:.2f} per unit**")
 
-# History Table
+        if st.form_submit_button("Save to Google Sheets ☁️"):
+            if sheet_ref:
+                new_row = [
+                    str(date),
+                    fuel_type,
+                    price,
+                    volume,
+                    total,
+                    odometer,
+                    distance,
+                    round(efficiency, 2)
+                ]
+                sheet_ref.append_row(new_row)
+                st.success("Successfully logged to Google Sheets!")
+                del st.session_state['extracted_all']
+                st.rerun()
+
+# History Section from Google Sheets
 st.divider()
-st.subheader("3. Consumption Log")
-history_df = load_data()
+st.subheader("3. Google Sheets History")
+df_logs, _ = load_sheet_data()
 
-if not history_df.empty:
-    st.dataframe(history_df.sort_values(by="Date", ascending=False), use_container_width=True)
-    col1, col2 = st.columns(2)
-    col1.metric("Total Cost", f"${history_df['Total Cost ($)'].sum():.2f}")
-    col2.metric("Total Fuel", f"{history_df['Volume (L/Gal)'].sum():.2f} units")
+if not df_logs.empty:
+    st.dataframe(df_logs.sort_index(ascending=False), use_container_width=True)
 else:
-    st.info("No logs saved yet.")
+    st.info("No records found in Google Sheets yet.")
