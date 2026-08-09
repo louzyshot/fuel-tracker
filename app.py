@@ -38,51 +38,75 @@ if image_file:
 
 if image_file and api_key:
     if st.button("Extract Fuel Data 🪄", type="primary"):
-        with st.spinner("Extracting receipt data via Gemini Vision..."):
-            client = genai.Client(api_key=api_key)
-            mime_type = image_file.type if hasattr(image_file, "type") and image_file.type else "image/jpeg"
-            image_bytes = image_file.getvalue()
-            
-            prompt = """
-            Analyze this fuel receipt or pump screen display. Extract the following:
-            - date: Date of purchase (YYYY-MM-DD format). If missing, return null.
-            - fuel_type: Type of fuel (e.g., Regular, Premium, Diesel). If unknown, return "Regular".
-            - unit_price: Price per liter or gallon (numeric value only).
-            - volume: Amount of fuel purchased in liters or gallons (numeric value only).
-            - total_price: Total cost paid (numeric value only).
+        with st.spinner("Finding active model & extracting receipt data..."):
+            try:
+                client = genai.Client(api_key=api_key)
+                mime_type = image_file.type if hasattr(image_file, "type") and image_file.type else "image/jpeg"
+                image_bytes = image_file.getvalue()
+                
+                prompt = """
+                Analyze this fuel receipt or pump screen display. Extract the following:
+                - date: Date of purchase (YYYY-MM-DD format). If missing, return null.
+                - fuel_type: Type of fuel (e.g., Regular, Premium, Diesel). If unknown, return "Regular".
+                - unit_price: Price per liter or gallon (numeric value only).
+                - volume: Amount of fuel purchased in liters or gallons (numeric value only).
+                - total_price: Total cost paid (numeric value only).
 
-            Return strictly a raw JSON object with keys: "date", "fuel_type", "unit_price", "volume", "total_price".
-            Do not wrap in markdown code fences or extra text.
-            """
+                Return strictly a raw JSON object with keys: "date", "fuel_type", "unit_price", "volume", "total_price".
+                Do not wrap in markdown code fences or extra text.
+                """
 
-            # Fallback array of active Gemini Flash models
-            candidate_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-002']
-            
-            extracted_data = None
-            last_error = None
-
-            for model_name in candidate_models:
+                # Automatically discover supported models for your API key
+                available_models = []
                 try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                            prompt
-                        ],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json"
-                        )
-                    )
-                    extracted_data = json.loads(response.text)
-                    st.session_state['data_extracted'] = extracted_data
-                    st.success(f"Extraction complete using {model_name}! Verify details below.")
-                    break  # Successfully processed, exit loop
-                except Exception as e:
-                    last_error = str(e)
-                    continue  # Try next candidate model
+                    for m in client.models.list():
+                        # Look for models supporting content generation
+                        if hasattr(m, 'supported_actions') and 'generateContent' in m.supported_actions:
+                            name = m.name.replace('models/', '')
+                            available_models.append(name)
+                        elif hasattr(m, 'name'):
+                            name = m.name.replace('models/', '')
+                            available_models.append(name)
+                except Exception:
+                    pass
 
-            if not extracted_data:
-                st.error(f"Failed to process image with available models. Last error: {last_error}")
+                # Fallback list if model listing is restricted
+                if not available_models:
+                    available_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash']
+
+                extracted_data = None
+                last_error = None
+                used_model = None
+
+                for model_name in available_models:
+                    # Filter for flash/vision models first
+                    if 'flash' in model_name or 'vision' in model_name or 'gemini' in model_name:
+                        try:
+                            response = client.models.generate_content(
+                                model=model_name,
+                                contents=[
+                                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                                    prompt
+                                ],
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json"
+                                )
+                            )
+                            extracted_data = json.loads(response.text)
+                            used_model = model_name
+                            st.session_state['data_extracted'] = extracted_data
+                            break
+                        except Exception as e:
+                            last_error = str(e)
+                            continue
+
+                if extracted_data:
+                    st.success(f"Successfully extracted using model: **{used_model}**")
+                else:
+                    st.error(f"Could not process image with available models. Error: {last_error}")
+
+            except Exception as e:
+                st.error(f"Initialization error: {str(e)}")
 
 elif image_file and not api_key:
     st.warning("Please provide a Gemini API Key in Streamlit Secrets or the sidebar to extract data.")
